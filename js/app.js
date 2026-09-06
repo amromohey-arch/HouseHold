@@ -1,456 +1,460 @@
 /* Household Ledger — app.js
-   Talks to a Google Apps Script Web App (see /apps-script/Code.gs) which
-   uses a Google Sheet as the database. Falls back to a local cache when
-   offline or not yet connected. */
+Talks to a Google Apps Script Web App (see /apps-script/Code.gs) which
+uses a Google Sheet as the database. Falls back to a local cache when
+offline or not yet connected. */
 
 const LS_KEYS = {
-  url: 'hl_apiUrl',
-  cache: 'hl_cache',
-  lastSync: 'hl_lastSync',
+   url: 'hl_apiUrl',
+   cache: 'hl_cache',
+   lastSync: 'hl_lastSync',
+   geminiKey: 'hl_geminiKey', // separate namespace — does not touch any other app's key
 };
+
+// Gemini models tried in order, matching what's confirmed working elsewhere.
+const GEMINI_MODELS = ['gemini-2.5-flash', 'gemini-2.5-pro'];
 
 const DEFAULT_CATEGORIES = [
-  'Housing', 'Utilities', 'Food & Groceries', 'Transport', 'Insurance',
-  'Health & Fitness', 'Subscriptions', 'Travel', 'Personal', 'Savings',
-];
+   'Housing', 'Utilities', 'Food & Groceries', 'Transport', 'Insurance',
+   'Health & Fitness', 'Subscriptions', 'Travel', 'Personal', 'Savings',
+   ];
 
 const state = {
-  apiUrl: localStorage.getItem(LS_KEYS.url) || '',
-  income: [],      // [{Person, Weekly, Notes}]
-  expenses: [],    // [{ID, Name, Category, Amount, Frequency, DueDay, Owner, Active, Notes}]
-  receipts: [],    // [{ID, Date, Category, Amount, Payer, Note}]
-  history: [],      // [{Timestamp, Action, Summary}]
-  lastSync: localStorage.getItem(LS_KEYS.lastSync) || null,
+   apiUrl: localStorage.getItem(LS_KEYS.url) || '',
+   geminiKey: localStorage.getItem(LS_KEYS.geminiKey) || '',
+   income: [],
+   expenses: [],
+   receipts: [],
+   history: [],
+   lastSync: localStorage.getItem(LS_KEYS.lastSync) || null,
 };
 
-// ---------- Utilities ----------
-
 function money(n) {
-  const v = Number(n) || 0;
-  const sign = v < 0 ? '-' : '';
-  return sign + '£' + Math.abs(v).toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+   const v = Number(n) || 0;
+   const sign = v < 0 ? '-' : '';
+   return sign + '£' + Math.abs(v).toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
 function monthlyEquivalent(amount, frequency) {
-  const a = Number(amount) || 0;
-  if (frequency === 'Weekly') return a * (52 / 12);
-  if (frequency === 'Yearly') return a / 12;
-  return a; // Monthly, or unspecified
+   const a = Number(amount) || 0;
+   if (frequency === 'Weekly') return a * (52 / 12);
+   if (frequency === 'Yearly') return a / 12;
+   return a;
 }
 
 function toast(msg, ms = 2600) {
-  const el = document.getElementById('toast');
-  el.textContent = msg;
-  el.hidden = false;
-  clearTimeout(toast._t);
-  toast._t = setTimeout(() => { el.hidden = true; }, ms);
+   const el = document.getElementById('toast');
+   el.textContent = msg;
+   el.hidden = false;
+   clearTimeout(toast._t);
+   toast._t = setTimeout(() => { el.hidden = true; }, ms);
 }
 
 function uid() {
-  return 'id-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+   return 'id-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
 }
 
 function ordinal(n) {
-  n = Number(n);
-  if (!n) return '';
-  const s = ['th', 'st', 'nd', 'rd'], v = n % 100;
-  return n + (s[(v - 20) % 10] || s[v] || s[0]);
+   n = Number(n);
+   if (!n) return '';
+   const s = ['th', 'st', 'nd', 'rd'], v = n % 100;
+   return n + (s[(v - 20) % 10] || s[v] || s[0]);
 }
 
 function isThisMonth(dateStr) {
-  if (!dateStr) return false;
-  const d = new Date(dateStr);
-  const now = new Date();
-  return d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth();
+   if (!dateStr) return false;
+   const d = new Date(dateStr);
+   const now = new Date();
+   return d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth();
 }
 
-// ---------- Networking ----------
-
 async function fetchData() {
-  if (!state.apiUrl) { renderAll(); return; }
-  setSyncStatus('Syncing…', true);
-  try {
-    const res = await fetch(state.apiUrl, { method: 'GET' });
-    const data = await res.json();
-    applyData(data);
-    saveCache();
-    state.lastSync = new Date().toISOString();
-    localStorage.setItem(LS_KEYS.lastSync, state.lastSync);
-    setSyncStatus('Synced');
-  } catch (err) {
-    console.error(err);
-    setSyncStatus('Offline — showing cached data');
-    toast('Could not reach your Google Sheet. Showing cached data.');
-  }
-  renderAll();
+   if (!state.apiUrl) { renderAll(); return; }
+   setSyncStatus('Syncing…', true);
+   try {
+      const res = await fetch(state.apiUrl, { method: 'GET' });
+      const data = await res.json();
+      applyData(data);
+      saveCache();
+      state.lastSync = new Date().toISOString();
+      localStorage.setItem(LS_KEYS.lastSync, state.lastSync);
+      setSyncStatus('Synced');
+   } catch (err) {
+      console.error(err);
+      setSyncStatus('Offline — showing cached data');
+      toast('Could not reach your Google Sheet. Showing cached data.');
+   }
+   renderAll();
 }
 
 async function postAction(action, payload) {
-  if (!state.apiUrl) { toast('Connect your Google Sheet in Settings first.'); return false; }
-  setSyncStatus('Saving…', true);
-  try {
-    const res = await fetch(state.apiUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // avoids CORS preflight
-      body: JSON.stringify({ action, payload }),
-    });
-    const data = await res.json();
-    if (!data.ok) throw new Error(data.error || 'Unknown error');
-    applyData(data.data);
-    saveCache();
-    setSyncStatus('Synced');
-    renderAll();
-    return true;
-  } catch (err) {
-    console.error(err);
-    setSyncStatus('Sync failed');
-    toast('Could not save: ' + err.message);
-    return false;
-  }
+   if (!state.apiUrl) { toast('Connect your Google Sheet in Settings first.'); return false; }
+   setSyncStatus('Saving…', true);
+   try {
+      const res = await fetch(state.apiUrl, {
+         method: 'POST',
+         headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+         body: JSON.stringify({ action, payload }),
+      });
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || 'Unknown error');
+      applyData(data.data);
+      saveCache();
+      setSyncStatus('Synced');
+      renderAll();
+      return true;
+   } catch (err) {
+      console.error(err);
+      setSyncStatus('Sync failed');
+      toast('Could not save: ' + err.message);
+      return false;
+   }
 }
 
 function applyData(data) {
-  if (!data) return;
-  state.income = data.income || [];
-  state.expenses = data.expenses || [];
-  state.receipts = data.receipts || [];
-  state.history = data.history || [];
+   if (!data) return;
+   state.income = data.income || [];
+   state.expenses = data.expenses || [];
+   state.receipts = data.receipts || [];
+   state.history = data.history || [];
 }
 
 function saveCache() {
-  localStorage.setItem(LS_KEYS.cache, JSON.stringify({
-    income: state.income, expenses: state.expenses, receipts: state.receipts, history: state.history,
-  }));
+   localStorage.setItem(LS_KEYS.cache, JSON.stringify({
+      income: state.income, expenses: state.expenses, receipts: state.receipts, history: state.history,
+   }));
 }
 
 function loadCache() {
-  const raw = localStorage.getItem(LS_KEYS.cache);
-  if (raw) applyData(JSON.parse(raw));
+   const raw = localStorage.getItem(LS_KEYS.cache);
+   if (raw) applyData(JSON.parse(raw));
 }
 
 function setSyncStatus(text, spinning = false) {
-  document.getElementById('syncStatus').textContent = text;
-  document.getElementById('refreshBtn').classList.toggle('spinning', spinning);
-  document.getElementById('offlineBanner').hidden = !!state.apiUrl;
+   document.getElementById('syncStatus').textContent = text;
+   document.getElementById('refreshBtn').classList.toggle('spinning', spinning);
+   document.getElementById('offlineBanner').hidden = !!state.apiUrl;
 }
 
-// ---------- Derived data ----------
-
 function activeExpenses() {
-  return state.expenses.filter(e => e.Active !== 'N');
+   return state.expenses.filter(e => e.Active !== 'N');
 }
 
 function totalIncomeMonthly() {
-  return state.income.reduce((sum, p) => sum + monthlyEquivalent(p.Weekly, 'Weekly'), 0);
+   return state.income.reduce((sum, p) => sum + monthlyEquivalent(p.Weekly, 'Weekly'), 0);
 }
 
 function totalCommittedMonthly() {
-  return activeExpenses()
-    .filter(e => e.Category !== 'Savings')
-    .reduce((sum, e) => sum + monthlyEquivalent(e.Amount, e.Frequency), 0);
+   return activeExpenses()
+   .filter(e => e.Category !== 'Savings')
+   .reduce((sum, e) => sum + monthlyEquivalent(e.Amount, e.Frequency), 0);
 }
 
 function totalSavedMonthly() {
-  return activeExpenses()
-    .filter(e => e.Category === 'Savings')
-    .reduce((sum, e) => sum + monthlyEquivalent(e.Amount, e.Frequency), 0);
+   return activeExpenses()
+   .filter(e => e.Category === 'Savings')
+   .reduce((sum, e) => sum + monthlyEquivalent(e.Amount, e.Frequency), 0);
 }
 
 function categoryTotals() {
-  const map = {};
-  activeExpenses().filter(e => e.Category !== 'Savings').forEach(e => {
-    const m = monthlyEquivalent(e.Amount, e.Frequency);
-    map[e.Category || 'Other'] = (map[e.Category || 'Other'] || 0) + m;
-  });
-  return Object.entries(map).sort((a, b) => b[1] - a[1]);
+   const map = {};
+   activeExpenses().filter(e => e.Category !== 'Savings').forEach(e => {
+      const m = monthlyEquivalent(e.Amount, e.Frequency);
+      map[e.Category || 'Other'] = (map[e.Category || 'Other'] || 0) + m;
+   });
+   return Object.entries(map).sort((a, b) => b[1] - a[1]);
 }
 
 function upcomingBills() {
-  const today = new Date().getDate();
-  return activeExpenses()
-    .filter(e => e.DueDay)
-    .map(e => {
+   const today = new Date().getDate();
+   return activeExpenses()
+   .filter(e => e.DueDay)
+   .map(e => {
       const due = Number(e.DueDay);
       const daysAway = due >= today ? due - today : due + 30 - today;
       return { ...e, daysAway, due };
-    })
-    .sort((a, b) => a.daysAway - b.daysAway)
-    .slice(0, 6);
+   })
+   .sort((a, b) => a.daysAway - b.daysAway)
+   .slice(0, 6);
 }
 
-// ---------- Rendering ----------
-
 function renderAll() {
-  renderDashboard();
-  renderExpenses();
-  renderReceipts();
-  renderHistory();
-  renderSettings();
-  document.getElementById('lastSyncedText').textContent = state.lastSync
-    ? new Date(state.lastSync).toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' })
-    : 'never';
+   renderDashboard();
+   renderExpenses();
+   renderReceipts();
+   renderHistory();
+   renderSettings();
+   document.getElementById('lastSyncedText').textContent = state.lastSync
+   ? new Date(state.lastSync).toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' })
+      : 'never';
 }
 
 function renderDashboard() {
-  const income = totalIncomeMonthly();
-  const committed = totalCommittedMonthly();
-  const saved = totalSavedMonthly();
-  const left = income - committed - saved;
+   const income = totalIncomeMonthly();
+   const committed = totalCommittedMonthly();
+   const saved = totalSavedMonthly();
+   const left = income - committed - saved;
 
-  const heroEl = document.getElementById('heroAmount');
-  heroEl.textContent = money(left);
-  heroEl.className = 'hero__amount ' + (left < 0 ? 'negative' : 'positive');
-  document.getElementById('heroSub').textContent =
-    `${money(income)} income · ${money(committed)} bills · ${money(saved)} savings`;
+const heroEl = document.getElementById('heroAmount');
+   heroEl.textContent = money(left);
+   heroEl.className = 'hero__amount ' + (left < 0 ? 'negative' : 'positive');
+   document.getElementById('heroSub').textContent =
+      `${money(income)} income · ${money(committed)} bills · ${money(saved)} savings`;
 
-  document.getElementById('tileIncome').textContent = money(income);
-  document.getElementById('tileSpend').textContent = money(committed);
-  document.getElementById('tileSaved').textContent = money(saved);
+document.getElementById('tileIncome').textContent = money(income);
+   document.getElementById('tileSpend').textContent = money(committed);
+   document.getElementById('tileSaved').textContent = money(saved);
 
-  const cats = categoryTotals();
-  const max = cats.length ? cats[0][1] : 1;
-  document.getElementById('categoryBars').innerHTML = cats.length ? cats.map(([name, amt]) => `
-    <div>
-      <div class="catbar__row"><span>${escapeHtml(name)}</span><span class="catbar__amount">${money(amt)}</span></div>
-      <div class="catbar__track"><div class="catbar__fill" style="width:${Math.max(4, (amt / max) * 100)}%"></div></div>
-    </div>`).join('') : '<div class="empty">No expenses yet</div>';
+const cats = categoryTotals();
+   const max = cats.length ? cats[0][1] : 1;
+   document.getElementById('categoryBars').innerHTML = cats.length ? cats.map(([name, amt]) => `
+   <div>
+   <div class="catbar__row"><span>${escapeHtml(name)}</span><span class="catbar__amount">${money(amt)}</span></div>
+   <div class="catbar__track"><div class="catbar__fill" style="width:${Math.max(4, (amt / max) * 100)}%"></div></div>
+   </div>`).join('') : '<div class="empty">No expenses yet</div>';
 
-  const upcoming = upcomingBills();
-  document.getElementById('upcomingList').innerHTML = upcoming.length ? upcoming.map(e => `
-    <div class="ledger-row">
-      <div class="ledger-row__main">
-        <div class="ledger-row__title">${escapeHtml(e.Name)}</div>
-        <div class="ledger-row__meta">Due ${ordinal(e.due)} · ${escapeHtml(e.Category || '')}</div>
-      </div>
-      <div class="ledger-row__amount out">${money(e.Amount)}</div>
-    </div>`).join('') : '<div class="empty">No bills with due dates set</div>';
+const upcoming = upcomingBills();
+   document.getElementById('upcomingList').innerHTML = upcoming.length ? upcoming.map(e => `
+   <div class="ledger-row">
+   <div class="ledger-row__main">
+   <div class="ledger-row__title">${escapeHtml(e.Name)}</div>
+   <div class="ledger-row__meta">Due ${ordinal(e.due)} · ${escapeHtml(e.Category || '')}</div>
+   </div>
+   <div class="ledger-row__amount out">${money(e.Amount)}</div>
+   </div>`).join('') : '<div class="empty">No bills with due dates set</div>';
 
-  const recentReceipts = [...state.receipts]
-    .sort((a, b) => new Date(b.Date) - new Date(a.Date))
-    .slice(0, 5);
-  document.getElementById('recentReceipts').innerHTML = recentReceipts.length ? recentReceipts.map(receiptRow).join('')
-    : '<div class="empty">No receipts logged yet</div>';
+const recentReceipts = [...state.receipts]
+   .sort((a, b) => new Date(b.Date) - new Date(a.Date))
+   .slice(0, 5);
+   document.getElementById('recentReceipts').innerHTML = recentReceipts.length ? recentReceipts.map(receiptRow).join('')
+      : '<div class="empty">No receipts logged yet</div>';
 }
 
 function receiptRow(r) {
-  return `<div class="ledger-row">
-    <div class="ledger-row__main">
-      <div class="ledger-row__title">${escapeHtml(r.Category)}</div>
-      <div class="ledger-row__meta">${formatDate(r.Date)}${r.Payer ? ' · ' + escapeHtml(r.Payer) : ''}${r.Note ? ' · ' + escapeHtml(r.Note) : ''}</div>
-    </div>
-    <div class="ledger-row__amount out">${money(r.Amount)}</div>
-  </div>`;
+   const photoLink = r.PhotoUrl
+   ? ` · <a href="${escapeHtml(r.PhotoUrl)}" target="_blank" rel="noopener" class="link" onclick="event.stopPropagation()">Photo</a>`
+      : '';
+   return `<div class="ledger-row">
+   <div class="ledger-row__main">
+   <div class="ledger-row__title">${escapeHtml(r.Category)}</div>
+   <div class="ledger-row__meta">${formatDate(r.Date)}${r.Payer ? ' · ' + escapeHtml(r.Payer) : ''}${r.Note ? ' · ' + escapeHtml(r.Note) : ''}${photoLink}</div>
+   </div>
+   <div class="ledger-row__amount out">${money(r.Amount)}</div>
+   </div>`;
 }
 
 function formatDate(d) {
-  if (!d) return '';
-  const dt = new Date(d);
-  if (isNaN(dt)) return d;
-  return dt.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
+   if (!d) return '';
+   const dt = new Date(d);
+   if (isNaN(dt)) return d;
+   return dt.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
 }
 
 function escapeHtml(s) {
-  return String(s ?? '').replace(/[&<>"']/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]));
+   return String(s ?? '').replace(/[&<>"']/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]));
 }
 
 function renderExpenses() {
-  const groups = {};
-  activeExpenses().forEach(e => {
-    const cat = e.Category || 'Other';
-    (groups[cat] = groups[cat] || []).push(e);
-  });
-  const catNames = Object.keys(groups).sort();
-  const html = catNames.length ? catNames.map(cat => `
-    <div class="expense-group">
-      <div class="expense-group__title">${escapeHtml(cat)}</div>
-      <div class="expense-group__card">
-        ${groups[cat].map(e => `
-          <div class="ledger-row clickable" data-edit-expense="${e.ID}">
-            <div class="ledger-row__main">
-              <div class="ledger-row__title">${escapeHtml(e.Name)}</div>
-              <div class="ledger-row__meta">${escapeHtml(e.Frequency || 'Monthly')}${e.DueDay ? ' · due ' + ordinal(e.DueDay) : ''} · <span class="tag ${ownerClass(e.Owner)}">${escapeHtml(e.Owner || 'Shared')}</span></div>
-            </div>
-            <div class="ledger-row__amount out">${money(e.Amount)}</div>
-          </div>`).join('')}
-      </div>
-    </div>`).join('') : '<div class="empty">No expenses yet. Tap Add to create one.</div>';
-  document.getElementById('expenseGroups').innerHTML = html;
+   const groups = {};
+   activeExpenses().forEach(e => {
+      const cat = e.Category || 'Other';
+      (groups[cat] = groups[cat] || []).push(e);
+   });
+   const catNames = Object.keys(groups).sort();
+   const html = catNames.length ? catNames.map(cat => `
+   <div class="expense-group">
+   <div class="expense-group__title">${escapeHtml(cat)}</div>
+   <div class="expense-group__card">
+   ${groups[cat].map(e => `
+   <div class="ledger-row clickable" data-edit-expense="${e.ID}">
+   <div class="ledger-row__main">
+   <div class="ledger-row__title">${escapeHtml(e.Name)}</div>
+   <div class="ledger-row__meta">${escapeHtml(e.Frequency || 'Monthly')}${e.DueDay ? ' · due ' + ordinal(e.DueDay) : ''} · <span class="tag ${ownerClass(e.Owner)}">${escapeHtml(e.Owner || 'Shared')}</span></div>
+   </div>
+   <div class="ledger-row__amount out">${money(e.Amount)}</div>
+   </div>`).join('')}
+   </div>
+   </div>`).join('') : '<div class="empty">No expenses yet. Tap Add to create one.</div>';
+   document.getElementById('expenseGroups').innerHTML = html;
 
-  document.querySelectorAll('[data-edit-expense]').forEach(row => {
-    row.addEventListener('click', () => openExpenseSheet(row.dataset.editExpense));
-  });
+document.querySelectorAll('[data-edit-expense]').forEach(row => {
+   row.addEventListener('click', () => openExpenseSheet(row.dataset.editExpense));
+});
 }
 
 function ownerClass(owner) {
-  if (owner === 'Amro') return 'owner-amro';
-  if (owner === 'Mira') return 'owner-mira';
-  return '';
+   if (owner === 'Amro') return 'owner-amro';
+   if (owner === 'Mira') return 'owner-mira';
+   return '';
 }
 
 function renderReceipts() {
-  const monthReceipts = state.receipts.filter(r => isThisMonth(r.Date));
-  const sumBy = cat => monthReceipts.filter(r => r.Category === cat).reduce((s, r) => s + (Number(r.Amount) || 0), 0);
-  document.getElementById('receiptFoodTotal').textContent = money(sumBy('Food & Groceries'));
-  document.getElementById('receiptFuelTotal').textContent = money(sumBy('Transport'));
+   const monthReceipts = state.receipts.filter(r => isThisMonth(r.Date));
+   const sumBy = cat => monthReceipts.filter(r => r.Category === cat).reduce((s, r) => s + (Number(r.Amount) || 0), 0);
+   document.getElementById('receiptFoodTotal').textContent = money(sumBy('Food & Groceries'));
+   document.getElementById('receiptFuelTotal').textContent = money(sumBy('Transport'));
 
-  const byMonth = {};
-  [...state.receipts].sort((a, b) => new Date(b.Date) - new Date(a.Date)).forEach(r => {
-    const d = new Date(r.Date);
-    const key = isNaN(d) ? 'Undated' : d.toLocaleDateString('en-GB', { month: 'long', year: 'numeric' });
-    (byMonth[key] = byMonth[key] || []).push(r);
-  });
-  const keys = Object.keys(byMonth);
-  document.getElementById('receiptGroups').innerHTML = keys.length ? keys.map(k => `
-    <div class="expense-group">
-      <div class="expense-group__title">${k}</div>
-      <div class="expense-group__card">
-        ${byMonth[k].map(receiptRow).join('')}
-      </div>
-    </div>`).join('') : '<div class="empty">No receipts yet. Tap Add to log one.</div>';
+const byMonth = {};
+   [...state.receipts].sort((a, b) => new Date(b.Date) - new Date(a.Date)).forEach(r => {
+      const d = new Date(r.Date);
+      const key = isNaN(d) ? 'Undated' : d.toLocaleDateString('en-GB', { month: 'long', year: 'numeric' });
+      (byMonth[key] = byMonth[key] || []).push(r);
+   });
+   const keys = Object.keys(byMonth);
+   document.getElementById('receiptGroups').innerHTML = keys.length ? keys.map(k => `
+   <div class="expense-group">
+   <div class="expense-group__title">${k}</div>
+   <div class="expense-group__card">
+   ${byMonth[k].map(receiptRow).join('')}
+   </div>
+   </div>`).join('') : '<div class="empty">No receipts yet. Tap Add to log one.</div>';
 }
 
 function renderHistory() {
-  const rows = [...state.history].sort((a, b) => new Date(b.Timestamp) - new Date(a.Timestamp));
-  document.getElementById('historyList').innerHTML = rows.length ? rows.map(h => `
-    <div class="ledger-row">
-      <div class="ledger-row__main">
-        <div class="ledger-row__title">${escapeHtml(h.Action)}</div>
-        <div class="ledger-row__meta">${escapeHtml(h.Summary || '')}</div>
-      </div>
-      <div class="ledger-row__amount">${new Date(h.Timestamp).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}</div>
-    </div>`).join('') : '<div class="empty">No changes logged yet</div>';
+   const rows = [...state.history].sort((a, b) => new Date(b.Timestamp) - new Date(a.Timestamp));
+   document.getElementById('historyList').innerHTML = rows.length ? rows.map(h => `
+   <div class="ledger-row">
+   <div class="ledger-row__main">
+   <div class="ledger-row__title">${escapeHtml(h.Action)}</div>
+   <div class="ledger-row__meta">${escapeHtml(h.Summary || '')}</div>
+   </div>
+   <div class="ledger-row__amount">${new Date(h.Timestamp).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}</div>
+   </div>`).join('') : '<div class="empty">No changes logged yet</div>';
 }
 
 function renderSettings() {
-  document.getElementById('apiUrlInput').value = state.apiUrl;
-  const editor = document.getElementById('incomeEditor');
-  const people = state.income.length ? state.income : [{ Person: 'Mira', Weekly: 0 }, { Person: 'Amro', Weekly: 0 }];
-  editor.innerHTML = people.map(p => `
-    <div class="income-row">
-      <label for="income-${escapeHtml(p.Person)}">${escapeHtml(p.Person)} — weekly income</label>
-      <input class="input" type="number" step="0.01" id="income-${escapeHtml(p.Person)}" value="${p.Weekly}" />
-    </div>`).join('');
+   document.getElementById('apiUrlInput').value = state.apiUrl;
+   document.getElementById('geminiKeyInput').value = state.geminiKey;
+   const editor = document.getElementById('incomeEditor');
+   const people = state.income.length ? state.income : [{ Person: 'Mira', Weekly: 0 }, { Person: 'Amro', Weekly: 0 }];
+   editor.innerHTML = people.map(p => `
+   <div class="income-row">
+   <label for="income-${escapeHtml(p.Person)}">${escapeHtml(p.Person)} — weekly income</label>
+   <input class="input" type="number" step="0.01" id="income-${escapeHtml(p.Person)}" value="${p.Weekly}" />
+   </div>`).join('');
 }
 
-// ---------- Navigation ----------
-
 function switchView(name) {
-  document.querySelectorAll('.view').forEach(v => v.hidden = true);
-  document.getElementById('view-' + name).hidden = false;
-  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.view === name));
-  document.getElementById('scrollArea').scrollTo({ top: 0 });
-  document.getElementById('backToTop').hidden = true;
+   document.querySelectorAll('.view').forEach(v => v.hidden = true);
+   document.getElementById('view-' + name).hidden = false;
+   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.view === name));
+   document.getElementById('scrollArea').scrollTo({ top: 0 });
+   document.getElementById('backToTop').hidden = true;
 }
 
 document.querySelectorAll('.tab').forEach(tab => {
-  tab.addEventListener('click', () => switchView(tab.dataset.view));
+   tab.addEventListener('click', () => switchView(tab.dataset.view));
 });
 document.querySelectorAll('[data-goto]').forEach(btn => {
-  btn.addEventListener('click', () => switchView(btn.dataset.goto));
+   btn.addEventListener('click', () => switchView(btn.dataset.goto));
 });
 document.getElementById('bannerSettingsBtn').addEventListener('click', () => switchView('settings'));
 
 window.addEventListener('scroll', () => {
-  document.getElementById('backToTop').hidden = window.scrollY < 400;
+   document.getElementById('backToTop').hidden = window.scrollY < 400;
 });
 document.getElementById('backToTop').addEventListener('click', () => {
-  window.scrollTo({ top: 0, behavior: 'smooth' });
+   window.scrollTo({ top: 0, behavior: 'smooth' });
 });
 
 document.getElementById('refreshBtn').addEventListener('click', fetchData);
 document.getElementById('hardRefreshBtn').addEventListener('click', fetchData);
 
-// ---------- Settings actions ----------
-
 document.getElementById('saveUrlBtn').addEventListener('click', () => {
-  const url = document.getElementById('apiUrlInput').value.trim();
-  if (!url) { toast('Enter a Web App URL first.'); return; }
-  state.apiUrl = url;
-  localStorage.setItem(LS_KEYS.url, url);
-  document.getElementById('urlSaveStatus').textContent = 'Saved. Syncing…';
-  fetchData();
+   const url = document.getElementById('apiUrlInput').value.trim();
+   if (!url) { toast('Enter a Web App URL first.'); return; }
+   state.apiUrl = url;
+   localStorage.setItem(LS_KEYS.url, url);
+   document.getElementById('urlSaveStatus').textContent = 'Saved. Syncing…';
+   fetchData();
+});
+
+document.getElementById('saveGeminiKeyBtn').addEventListener('click', () => {
+   const key = document.getElementById('geminiKeyInput').value.trim();
+   state.geminiKey = key;
+   if (key) localStorage.setItem(LS_KEYS.geminiKey, key);
+   else localStorage.removeItem(LS_KEYS.geminiKey);
+   document.getElementById('geminiSaveStatus').textContent = key ? 'Saved' : 'Cleared';
+   toast(key ? 'Scanner key saved' : 'Scanner key cleared');
 });
 
 document.getElementById('saveIncomeBtn').addEventListener('click', async () => {
-  const people = state.income.length ? state.income : [{ Person: 'Mira' }, { Person: 'Amro' }];
-  const updates = people.map(p => ({
-    Person: p.Person,
-    Weekly: Number(document.getElementById(`income-${p.Person}`).value) || 0,
-  }));
-  const ok = await postAction('updateIncome', { people: updates });
-  document.getElementById('incomeSaveStatus').textContent = ok ? 'Saved' : 'Failed';
-  if (ok) toast('Income updated');
+   const people = state.income.length ? state.income : [{ Person: 'Mira' }, { Person: 'Amro' }];
+   const updates = people.map(p => ({
+      Person: p.Person,
+      Weekly: Number(document.getElementById(`income-${p.Person}`).value) || 0,
+   }));
+   const ok = await postAction('updateIncome', { people: updates });
+   document.getElementById('incomeSaveStatus').textContent = ok ? 'Saved' : 'Failed';
+   if (ok) toast('Income updated');
 });
 
-// ---------- Expense sheet (add/edit) ----------
-
 function openExpenseSheet(id) {
-  const existing = id ? state.expenses.find(e => e.ID === id) : null;
-  const root = document.getElementById('modalRoot');
-  const categoryOptions = Array.from(new Set([...DEFAULT_CATEGORIES, ...state.expenses.map(e => e.Category)].filter(Boolean)));
+   const existing = id ? state.expenses.find(e => e.ID === id) : null;
+   const root = document.getElementById('modalRoot');
+   const categoryOptions = Array.from(new Set([...DEFAULT_CATEGORIES, ...state.expenses.map(e => e.Category)].filter(Boolean)));
 
-  root.innerHTML = `
-    <div class="sheet-backdrop" id="sheetBackdrop">
-      <div class="sheet" role="dialog" aria-modal="true">
-        <div class="sheet__grabber"></div>
-        <div class="sheet__head">
-          <h2>${existing ? 'Edit expense' : 'Add expense'}</h2>
-          <button class="sheet__close" id="sheetClose" aria-label="Close">&times;</button>
-        </div>
+root.innerHTML = `
+<div class="sheet-backdrop" id="sheetBackdrop">
+<div class="sheet" role="dialog" aria-modal="true">
+<div class="sheet__grabber"></div>
+<div class="sheet__head">
+<h2>${existing ? 'Edit expense' : 'Add expense'}</h2>
+<button class="sheet__close" id="sheetClose" aria-label="Close">&times;</button>
+</div>
 
-        <label class="field-label" for="f-name">Name</label>
-        <input class="input" id="f-name" placeholder="e.g. Amro Sim" value="${existing ? escapeHtml(existing.Name) : ''}" />
+<label class="field-label" for="f-name">Name</label>
+<input class="input" id="f-name" placeholder="e.g. Amro Sim" value="${existing ? escapeHtml(existing.Name) : ''}" />
 
-        <label class="field-label" for="f-category">Category</label>
-        <input class="input" id="f-category" list="categoryList" placeholder="e.g. Utilities" value="${existing ? escapeHtml(existing.Category) : ''}" />
-        <datalist id="categoryList">${categoryOptions.map(c => `<option value="${escapeHtml(c)}">`).join('')}</datalist>
+<label class="field-label" for="f-category">Category</label>
+<input class="input" id="f-category" list="categoryList" placeholder="e.g. Utilities" value="${existing ? escapeHtml(existing.Category) : ''}" />
+<datalist id="categoryList">${categoryOptions.map(c => `<option value="${escapeHtml(c)}">`).join('')}</datalist>
 
-        <div class="field-row">
-          <div>
-            <label class="field-label" for="f-amount">Amount (£)</label>
-            <input class="input" id="f-amount" type="number" step="0.01" value="${existing ? existing.Amount : ''}" />
-          </div>
-          <div>
-            <label class="field-label" for="f-frequency">Frequency</label>
-            <select class="input" id="f-frequency">
-              <option value="Weekly" ${existing?.Frequency === 'Weekly' ? 'selected' : ''}>Weekly</option>
-              <option value="Monthly" ${!existing || existing?.Frequency === 'Monthly' ? 'selected' : ''}>Monthly</option>
-              <option value="Yearly" ${existing?.Frequency === 'Yearly' ? 'selected' : ''}>Yearly</option>
-            </select>
-          </div>
-        </div>
+<div class="field-row">
+<div>
+<label class="field-label" for="f-amount">Amount (£)</label>
+<input class="input" id="f-amount" type="number" step="0.01" value="${existing ? existing.Amount : ''}" />
+</div>
+<div>
+<label class="field-label" for="f-frequency">Frequency</label>
+<select class="input" id="f-frequency">
+<option value="Weekly" ${existing?.Frequency === 'Weekly' ? 'selected' : ''}>Weekly</option>
+<option value="Monthly" ${!existing || existing?.Frequency === 'Monthly' ? 'selected' : ''}>Monthly</option>
+<option value="Yearly" ${existing?.Frequency === 'Yearly' ? 'selected' : ''}>Yearly</option>
+</select>
+</div>
+</div>
 
-        <div class="field-row">
-          <div>
-            <label class="field-label" for="f-dueday">Due day of month</label>
-            <input class="input" id="f-dueday" type="number" min="1" max="31" placeholder="e.g. 15" value="${existing?.DueDay || ''}" />
-          </div>
-          <div>
-            <label class="field-label" for="f-owner">Paid by</label>
-            <select class="input" id="f-owner">
-              <option value="Shared" ${!existing || existing?.Owner === 'Shared' ? 'selected' : ''}>Shared</option>
-              <option value="Amro" ${existing?.Owner === 'Amro' ? 'selected' : ''}>Amro</option>
-              <option value="Mira" ${existing?.Owner === 'Mira' ? 'selected' : ''}>Mira</option>
-            </select>
-          </div>
-        </div>
+<div class="field-row">
+<div>
+<label class="field-label" for="f-dueday">Due day of month</label>
+<input class="input" id="f-dueday" type="number" min="1" max="31" placeholder="e.g. 15" value="${existing?.DueDay || ''}" />
+</div>
+<div>
+<label class="field-label" for="f-owner">Paid by</label>
+<select class="input" id="f-owner">
+<option value="Shared" ${!existing || existing?.Owner === 'Shared' ? 'selected' : ''}>Shared</option>
+<option value="Amro" ${existing?.Owner === 'Amro' ? 'selected' : ''}>Amro</option>
+<option value="Mira" ${existing?.Owner === 'Mira' ? 'selected' : ''}>Mira</option>
+</select>
+</div>
+</div>
 
-        <label class="field-label" for="f-notes">Notes (optional)</label>
-        <input class="input" id="f-notes" value="${existing ? escapeHtml(existing.Notes || '') : ''}" />
+<label class="field-label" for="f-notes">Notes (optional)</label>
+<input class="input" id="f-notes" value="${existing ? escapeHtml(existing.Notes || '') : ''}" />
 
-        <div class="sheet__footer">
-          <button class="btn btn--primary btn--full" id="f-save">Save</button>
-        </div>
-        ${existing ? '<div class="sheet__footer"><button class="btn btn--danger btn--full" id="f-delete">Delete expense</button></div>' : ''}
-      </div>
-    </div>`;
+<div class="sheet__footer">
+<button class="btn btn--primary btn--full" id="f-save">Save</button>
+</div>
+${existing ? '<div class="sheet__footer"><button class="btn btn--danger btn--full" id="f-delete">Delete expense</button></div>' : ''}
+</div>
+</div>`;
 
-  const close = () => { root.innerHTML = ''; };
-  document.getElementById('sheetClose').addEventListener('click', close);
-  document.getElementById('sheetBackdrop').addEventListener('click', e => { if (e.target.id === 'sheetBackdrop') close(); });
+const close = () => { root.innerHTML = ''; };
+   document.getElementById('sheetClose').addEventListener('click', close);
+   document.getElementById('sheetBackdrop').addEventListener('click', e => { if (e.target.id === 'sheetBackdrop') close(); });
 
-  document.getElementById('f-save').addEventListener('click', async () => {
-    const payload = {
+document.getElementById('f-save').addEventListener('click', async () => {
+   const payload = {
       ID: existing ? existing.ID : uid(),
       Name: document.getElementById('f-name').value.trim(),
       Category: document.getElementById('f-category').value.trim() || 'Other',
@@ -460,93 +464,231 @@ function openExpenseSheet(id) {
       Owner: document.getElementById('f-owner').value,
       Notes: document.getElementById('f-notes').value.trim(),
       Active: 'Y',
-    };
-    if (!payload.Name) { toast('Give the expense a name.'); return; }
-    const ok = await postAction(existing ? 'updateExpense' : 'addExpense', payload);
-    if (ok) { toast(existing ? 'Expense updated' : 'Expense added'); close(); }
-  });
+   };
+   if (!payload.Name) { toast('Give the expense a name.'); return; }
+   const ok = await postAction(existing ? 'updateExpense' : 'addExpense', payload);
+   if (ok) { toast(existing ? 'Expense updated' : 'Expense added'); close(); }
+});
 
-  if (existing) {
-    document.getElementById('f-delete').addEventListener('click', async () => {
+if (existing) {
+   document.getElementById('f-delete').addEventListener('click', async () => {
       if (!confirm(`Delete "${existing.Name}"?`)) return;
       const ok = await postAction('deleteExpense', { ID: existing.ID });
       if (ok) { toast('Expense deleted'); close(); }
-    });
-  }
+   });
+}
 }
 
 document.getElementById('addExpenseBtn').addEventListener('click', () => openExpenseSheet(null));
 
-// ---------- Receipt sheet (add) ----------
+let pendingReceiptPhoto = null;
 
 function openReceiptSheet() {
-  const root = document.getElementById('modalRoot');
-  const categoryOptions = Array.from(new Set([...DEFAULT_CATEGORIES, ...state.receipts.map(r => r.Category)].filter(Boolean)));
-  const today = new Date().toISOString().slice(0, 10);
+   const root = document.getElementById('modalRoot');
+   const categoryOptions = Array.from(new Set([...DEFAULT_CATEGORIES, ...state.receipts.map(r => r.Category)].filter(Boolean)));
+   const today = new Date().toISOString().slice(0, 10);
+   pendingReceiptPhoto = null;
 
-  root.innerHTML = `
-    <div class="sheet-backdrop" id="sheetBackdrop">
-      <div class="sheet" role="dialog" aria-modal="true">
-        <div class="sheet__grabber"></div>
-        <div class="sheet__head">
-          <h2>Add receipt</h2>
-          <button class="sheet__close" id="sheetClose" aria-label="Close">&times;</button>
-        </div>
+const scannerAvailable = !!state.geminiKey;
 
-        <label class="field-label" for="r-date">Date</label>
-        <input class="input" id="r-date" type="date" value="${today}" />
+root.innerHTML = `
+<div class="sheet-backdrop" id="sheetBackdrop">
+<div class="sheet" role="dialog" aria-modal="true">
+<div class="sheet__grabber"></div>
+<div class="sheet__head">
+<h2>Add receipt</h2>
+<button class="sheet__close" id="sheetClose" aria-label="Close">&times;</button>
+</div>
 
-        <label class="field-label" for="r-category">Category</label>
-        <input class="input" id="r-category" list="rcategoryList" placeholder="e.g. Food & Groceries" value="Food & Groceries" />
-        <datalist id="rcategoryList">${categoryOptions.map(c => `<option value="${escapeHtml(c)}">`).join('')}</datalist>
+${scannerAvailable ? `
+<div class="scanrow">
+<label class="scanbtn">
+<input type="file" accept="image/*" capture="environment" id="r-photo-camera" hidden />
+<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 8h3l1.5-2h7L17 8h3v11H4z"/><circle cx="12" cy="13.5" r="3.2"/></svg>
+Take photo
+</label>
+<label class="scanbtn">
+<input type="file" accept="image/*" id="r-photo-gallery" hidden />
+<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3.5" y="4.5" width="17" height="15" rx="2"/><path d="m3.5 16 4.5-5 3.5 3.5 3-3 5.5 5.5"/></svg>
+Choose photo
+</label>
+</div>
+<img id="r-photo-preview" class="receipt-preview" hidden alt="Receipt preview" />
+<div id="r-scan-status" class="scan-status" hidden></div>
+` : `
+<p class="card__text">Add a Google AI key in Settings to scan receipt photos and auto-fill this form.</p>
+`}
 
-        <div class="field-row">
-          <div>
-            <label class="field-label" for="r-amount">Amount (£)</label>
-            <input class="input" id="r-amount" type="number" step="0.01" />
-          </div>
-          <div>
-            <label class="field-label" for="r-payer">Paid by</label>
-            <select class="input" id="r-payer">
-              <option value="Shared">Shared</option>
-              <option value="Amro">Amro</option>
-              <option value="Mira">Mira</option>
-            </select>
-          </div>
-        </div>
+<label class="field-label" for="r-date">Date</label>
+<input class="input" id="r-date" type="date" value="${today}" />
 
-        <label class="field-label" for="r-note">Note (optional)</label>
-        <input class="input" id="r-note" placeholder="e.g. Tesco weekly shop" />
+<label class="field-label" for="r-category">Category</label>
+<input class="input" id="r-category" list="rcategoryList" placeholder="e.g. Food & Groceries" value="Food & Groceries" />
+<datalist id="rcategoryList">${categoryOptions.map(c => `<option value="${escapeHtml(c)}">`).join('')}</datalist>
 
-        <div class="sheet__footer">
-          <button class="btn btn--primary btn--full" id="r-save">Save receipt</button>
-        </div>
-      </div>
-    </div>`;
+<div class="field-row">
+<div>
+<label class="field-label" for="r-amount">Amount (£)</label>
+<input class="input" id="r-amount" type="number" step="0.01" />
+</div>
+<div>
+<label class="field-label" for="r-payer">Paid by</label>
+<select class="input" id="r-payer">
+<option value="Shared">Shared</option>
+<option value="Amro">Amro</option>
+<option value="Mira">Mira</option>
+</select>
+</div>
+</div>
 
-  const close = () => { root.innerHTML = ''; };
-  document.getElementById('sheetClose').addEventListener('click', close);
-  document.getElementById('sheetBackdrop').addEventListener('click', e => { if (e.target.id === 'sheetBackdrop') close(); });
+<label class="field-label" for="r-note">Note (optional)</label>
+<input class="input" id="r-note" placeholder="e.g. Tesco weekly shop" />
 
-  document.getElementById('r-save').addEventListener('click', async () => {
-    const amount = Number(document.getElementById('r-amount').value);
-    if (!amount) { toast('Enter an amount.'); return; }
-    const payload = {
+<div class="sheet__footer">
+<button class="btn btn--primary btn--full" id="r-save">Save receipt</button>
+</div>
+</div>
+</div>`;
+
+const close = () => { root.innerHTML = ''; pendingReceiptPhoto = null; };
+   document.getElementById('sheetClose').addEventListener('click', close);
+   document.getElementById('sheetBackdrop').addEventListener('click', e => { if (e.target.id === 'sheetBackdrop') close(); });
+
+if (scannerAvailable) {
+   document.getElementById('r-photo-camera').addEventListener('change', e => handleReceiptPhoto(e.target.files[0]));
+   document.getElementById('r-photo-gallery').addEventListener('change', e => handleReceiptPhoto(e.target.files[0]));
+}
+
+document.getElementById('r-save').addEventListener('click', async () => {
+   const amount = Number(document.getElementById('r-amount').value);
+   if (!amount) { toast('Enter an amount.'); return; }
+   const payload = {
       ID: uid(),
       Date: document.getElementById('r-date').value || today,
       Category: document.getElementById('r-category').value.trim() || 'Other',
       Amount: amount,
       Payer: document.getElementById('r-payer').value,
       Note: document.getElementById('r-note').value.trim(),
-    };
-    const ok = await postAction('addReceipt', payload);
-    if (ok) { toast('Receipt added'); close(); }
-  });
+   };
+   if (pendingReceiptPhoto) {
+      payload.PhotoBase64 = pendingReceiptPhoto.base64;
+      payload.PhotoFilename = pendingReceiptPhoto.filename;
+   }
+   const ok = await postAction('addReceipt', payload);
+   if (ok) { toast('Receipt added'); close(); }
+});
+}
+
+function resizeImageToBase64(file, maxDimension = 1600, quality = 0.82) {
+   return new Promise((resolve, reject) => {
+      const img = new Image();
+      const reader = new FileReader();
+      reader.onload = e => { img.src = e.target.result; };
+      reader.onerror = reject;
+      img.onload = () => {
+         let { width, height } = img;
+         if (width > maxDimension || height > maxDimension) {
+            const scale = maxDimension / Math.max(width, height);
+            width = Math.round(width * scale);
+            height = Math.round(height * scale);
+         }
+         const canvas = document.createElement('canvas');
+         canvas.width = width; canvas.height = height;
+         canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+         resolve(canvas.toDataURL('image/jpeg', quality).split(',')[1]);
+      };
+      img.onerror = reject;
+      reader.readAsDataURL(file);
+   });
+}
+
+async function handleReceiptPhoto(file) {
+   if (!file) return;
+   const preview = document.getElementById('r-photo-preview');
+   const status = document.getElementById('r-scan-status');
+
+const base64 = await resizeImageToBase64(file);
+   pendingReceiptPhoto = { base64, filename: (file.name || 'receipt') + '.jpg' };
+   preview.src = 'data:image/jpeg;base64,' + base64;
+   preview.hidden = false;
+
+status.hidden = false;
+   status.className = 'scan-status';
+   status.innerHTML = '<span class="spinner"></span> Reading receipt…';
+
+try {
+   const data = await scanReceiptWithGemini(base64);
+   applyScannedReceipt(data);
+   status.className = 'scan-status success';
+   status.textContent = 'Scanned — check the fields below before saving.';
+} catch (err) {
+   console.error(err);
+   status.className = 'scan-status error';
+   status.textContent = "Couldn't read that receipt — enter the details manually.";
+}
+}
+
+async function scanReceiptWithGemini(base64) {
+   const prompt = 'CRITICAL: respond with ONLY valid JSON, no markdown, no explanation.\n' +
+      'This is a photo of a shopping or fuel receipt. Extract:\n' +
+      '- date: the receipt date as YYYY-MM-DD (use the year shown, or omit if not printed)\n' +
+      '- merchant: the store or business name\n' +
+      '- total: the final total amount paid, as a plain number (no currency symbol)\n' +
+      '- category: your best single guess from exactly one of: ' + DEFAULT_CATEGORIES.join(', ') + '\n' +
+      'Return ONLY this JSON shape: {"date":"2026-09-06","merchant":"Tesco","total":42.15,"category":"Food & Groceries"}\n' +
+      'If a field is unclear, use an empty string ("") or 0, but always return valid JSON in that shape.';
+
+let lastError;
+   for (const model of GEMINI_MODELS) {
+      try {
+         const res = await fetch(
+            `https://generativelanguage.googleapis.com/v1/models/${model}:generateContent?key=${state.geminiKey}`,
+            {
+               method: 'POST',
+               headers: { 'Content-Type': 'application/json' },
+               body: JSON.stringify({
+                  contents: [{ parts: [{ inline_data: { mime_type: 'image/jpeg', data: base64 } }, { text: prompt }] }],
+                  generationConfig: { temperature: 0, maxOutputTokens: 1024 },
+               }),
+            }
+            );
+         const data = await res.json();
+         if (data.error) { lastError = new Error(data.error.message); continue; }
+         const text = data?.candidates?.[0]?.content?.parts?.[0]?.text?.replace(/```json|```/g, '').trim();
+         const match = text && text.match(/\{[\s\S]*\}/);
+         if (!match) { lastError = new Error('No JSON in response'); continue; }
+         return JSON.parse(match[0]);
+      } catch (err) {
+         lastError = err;
+      }
+   }
+   throw lastError || new Error('Scan failed');
+}
+
+function applyScannedReceipt(data) {
+   if (data.date) {
+      const d = document.getElementById('r-date');
+      d.value = data.date;
+      d.classList.add('field-scanned');
+   }
+   if (data.merchant) {
+      const note = document.getElementById('r-note');
+      if (!note.value) note.value = data.merchant;
+      note.classList.add('field-scanned');
+   }
+   if (data.category) {
+      const cat = document.getElementById('r-category');
+      cat.value = data.category;
+      cat.classList.add('field-scanned');
+   }
+   if (data.total) {
+      const amt = document.getElementById('r-amount');
+      amt.value = Number(data.total).toFixed(2);
+      amt.classList.add('field-scanned');
+   }
 }
 
 document.getElementById('addReceiptBtn').addEventListener('click', openReceiptSheet);
-
-// ---------- Init ----------
 
 loadCache();
 renderAll();
