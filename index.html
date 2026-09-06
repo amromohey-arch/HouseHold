@@ -130,6 +130,16 @@
       </div>
     </div>
 
+<div class="card">
+<div class="card__head"><h2>Receipt scanner</h2></div>
+<p class="card__text">Optional: paste a Google AI (Gemini) key to auto-read date, merchant, and total off a receipt photo. Get a free key at <strong>aistudio.google.com/apikey</strong>. This is separate from any other app's key — nothing else gets touched.</p>
+<input type="password" id="geminiKeyInput" class="input" placeholder="AIza…" />
+<div class="settings__actions">
+<button class="btn btn--primary" id="saveGeminiKeyBtn">Save key</button>
+<span id="geminiSaveStatus" class="card__hint"></span>
+</div>
+</div>
+
     <div class="card">
       <div class="card__head"><h2>Income</h2></div>
       <div id="incomeEditor"></div>
