@@ -243,3 +243,6 @@ main { max-width: 640px; margin: 0 auto; padding: 18px 16px 24px; }
 @media (min-width: 640px) {
   .hero__amount { font-size: 3.2rem; }
 }
+
+
+.view[hidden] { display: none !important; }
